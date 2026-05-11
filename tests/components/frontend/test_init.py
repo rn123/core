@@ -19,6 +19,7 @@ from homeassistant.components.frontend import (
     CONF_EXTRA_MODULE_URL,
     CONF_GITHUB_TOKEN,
     CONF_MAP_TILE_ATTRIBUTION,
+    CONF_MAP_TILE_LAYER,
     CONF_MAP_TILE_MAX_ZOOM,
     CONF_MAP_TILE_URL,
     CONF_THEMES,
@@ -743,6 +744,153 @@ async def test_map_tile_layer_absent_by_default(
     assert resp.status == 200
     text = await resp.text()
     assert "__HA_MAP_TILE_LAYER__" not in text
+
+
+# Tier 2 fixtures + tests: nested map_tile_layer with WMS + overlays.
+
+
+@pytest.fixture
+async def mock_http_client_with_map_tile_wms(
+    hass: HomeAssistant,
+    aiohttp_client: ClientSessionGenerator,
+    ignore_frontend_deps: None,
+) -> TestClient:
+    """Set up frontend with a nested WMS map_tile_layer config."""
+    assert await async_setup_component(
+        hass,
+        "frontend",
+        {
+            DOMAIN: {
+                CONF_MAP_TILE_LAYER: {
+                    "base": {
+                        "type": "wms",
+                        "url": "http://qgis.example.com/ows",
+                        "attribution": "QGIS Server",
+                        "wms": {
+                            "layers": "hillshade,roads",
+                            "format": "image/png",
+                            "transparent": True,
+                            "version": "1.3.0",
+                        },
+                    },
+                }
+            }
+        },
+    )
+    return await aiohttp_client(hass.http.app)
+
+
+@pytest.fixture
+async def mock_http_client_with_map_tile_overlays(
+    hass: HomeAssistant,
+    aiohttp_client: ClientSessionGenerator,
+    ignore_frontend_deps: None,
+) -> TestClient:
+    """Set up frontend with a base + two overlay layers."""
+    assert await async_setup_component(
+        hass,
+        "frontend",
+        {
+            DOMAIN: {
+                CONF_MAP_TILE_LAYER: {
+                    "base": {
+                        "url": "https://tile.example.com/{z}/{x}/{y}.png",
+                        "attribution": "Base",
+                    },
+                    "overlays": [
+                        {
+                            "type": "wms",
+                            "url": "http://wms.example.com/ows",
+                            "attribution": "WMS overlay",
+                            "opacity": 0.7,
+                            "wms": {"layers": "roads"},
+                        },
+                        {
+                            "url": "https://overlay.example.com/{z}/{x}/{y}.png",
+                            "attribution": "XYZ overlay",
+                            "opacity": 0.5,
+                        },
+                    ],
+                }
+            }
+        },
+    )
+    return await aiohttp_client(hass.http.app)
+
+
+@pytest.fixture
+async def mock_http_client_with_map_tile_both(
+    hass: HomeAssistant,
+    aiohttp_client: ClientSessionGenerator,
+    ignore_frontend_deps: None,
+) -> TestClient:
+    """Set up frontend with BOTH flat and nested map_tile config."""
+    assert await async_setup_component(
+        hass,
+        "frontend",
+        {
+            DOMAIN: {
+                CONF_MAP_TILE_URL: "https://flat.example.com/{z}/{x}/{y}.png",
+                CONF_MAP_TILE_ATTRIBUTION: "Flat attribution",
+                CONF_MAP_TILE_MAX_ZOOM: 19,
+                CONF_MAP_TILE_LAYER: {
+                    "base": {
+                        "url": "https://nested.example.com/{z}/{x}/{y}.png",
+                        "attribution": "Nested attribution",
+                    }
+                },
+            }
+        },
+    )
+    return await aiohttp_client(hass.http.app)
+
+
+@pytest.mark.usefixtures("mock_onboarded")
+async def test_map_tile_wms(
+    mock_http_client_with_map_tile_wms: TestClient,
+) -> None:
+    """Test that a nested WMS map_tile_layer is rendered into index.html."""
+    resp = await mock_http_client_with_map_tile_wms.get("")
+    assert resp.status == 200
+    text = await resp.text()
+
+    assert "window.__HA_MAP_TILE_LAYER__" in text
+    assert '"type": "wms"' in text
+    assert '"url": "http://qgis.example.com/ows"' in text
+    assert '"layers": "hillshade,roads"' in text
+    assert '"format": "image/png"' in text
+    assert '"transparent": true' in text
+    assert '"version": "1.3.0"' in text
+
+
+@pytest.mark.usefixtures("mock_onboarded")
+async def test_map_tile_overlays(
+    mock_http_client_with_map_tile_overlays: TestClient,
+) -> None:
+    """Test that overlay layers round-trip through render."""
+    resp = await mock_http_client_with_map_tile_overlays.get("")
+    assert resp.status == 200
+    text = await resp.text()
+
+    assert '"url": "https://tile.example.com/{z}/{x}/{y}.png"' in text
+    assert '"url": "http://wms.example.com/ows"' in text
+    assert '"url": "https://overlay.example.com/{z}/{x}/{y}.png"' in text
+    assert '"opacity": 0.7' in text
+    assert '"opacity": 0.5' in text
+    assert '"layers": "roads"' in text
+
+
+@pytest.mark.usefixtures("mock_onboarded")
+async def test_map_tile_layer_precedence(
+    mock_http_client_with_map_tile_both: TestClient,
+) -> None:
+    """Test that the nested map_tile_layer wins over flat keys."""
+    resp = await mock_http_client_with_map_tile_both.get("")
+    assert resp.status == 200
+    text = await resp.text()
+
+    assert '"url": "https://nested.example.com/{z}/{x}/{y}.png"' in text
+    assert "https://flat.example.com" not in text
 
 
 async def test_get_panels(

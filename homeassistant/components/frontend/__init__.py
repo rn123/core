@@ -60,6 +60,8 @@ CONF_GITHUB_TOKEN = "github_token"
 CONF_MAP_TILE_URL = "map_tile_url"
 CONF_MAP_TILE_ATTRIBUTION = "map_tile_attribution"
 CONF_MAP_TILE_MAX_ZOOM = "map_tile_max_zoom"
+# Tier 2: nested map_tile_layer config with WMS + overlay support.
+CONF_MAP_TILE_LAYER = "map_tile_layer"
 
 DEV_ARTIFACTS_DIR = "development_artifacts"
 
@@ -69,7 +71,7 @@ DEFAULT_THEME_COLOR = "#2980b9"
 DATA_PANELS: HassKey[dict[str, Panel]] = HassKey("frontend_panels")
 DATA_EXTRA_MODULE_URL: HassKey[UrlManager] = HassKey("frontend_extra_module_url")
 DATA_EXTRA_JS_URL_ES5: HassKey[UrlManager] = HassKey("frontend_extra_js_url_es5")
-DATA_MAP_TILE_LAYER: HassKey[frozenset[tuple[str, Any]] | None] = HassKey(
+DATA_MAP_TILE_LAYER: HassKey[tuple | frozenset[tuple[str, Any]] | None] = HassKey(
     "frontend_map_tile_layer"
 )
 
@@ -98,6 +100,35 @@ DEFAULT_THEME = "default"
 VALUE_NO_THEME = "none"
 
 PRIMARY_COLOR = "primary-color"
+
+
+def _freeze(obj: Any) -> Any:
+    """Recursively freeze dict/list trees into hashable tuple structures.
+
+    Used so the nested map_tile_layer config can be lru_cache-keyed by
+    _async_render_index_cached. dict → sorted tuple-of-(key, frozen-value);
+    list → tuple of frozen elements; primitives passthrough.
+    """
+    if isinstance(obj, dict):
+        return tuple(sorted((k, _freeze(v)) for k, v in obj.items()))
+    if isinstance(obj, list):
+        return tuple(_freeze(x) for x in obj)
+    return obj
+
+
+def _thaw(obj: Any) -> Any:
+    """Inverse of _freeze: tuple-of-(str-key, value) → dict; tuple → list."""
+    if (
+        isinstance(obj, tuple)
+        and obj
+        and all(
+            isinstance(x, tuple) and len(x) == 2 and isinstance(x[0], str) for x in obj
+        )
+    ):
+        return {k: _thaw(v) for k, v in obj}
+    if isinstance(obj, tuple):
+        return [_thaw(x) for x in obj]
+    return obj
 
 
 LEGACY_THEME_SCHEMA = vol.Any(
@@ -148,6 +179,41 @@ def _validate_themes(themes: dict) -> dict[str, Any]:
     return validated_themes
 
 
+# Tier 2: nested map_tile_layer schema supporting WMS + overlay layers.
+_WMS_SCHEMA = vol.Schema(
+    {
+        vol.Required("layers"): cv.string,
+        vol.Optional("format", default="image/png"): cv.string,
+        vol.Optional("transparent", default=True): cv.boolean,
+        vol.Optional("version", default="1.3.0"): cv.string,
+        vol.Optional("crs"): cv.string,
+        vol.Optional("uppercase", default=False): cv.boolean,
+    }
+)
+_BASE_LAYER_SCHEMA = vol.Schema(
+    {
+        vol.Required("url"): cv.string,
+        vol.Optional("type", default="xyz"): vol.In(["xyz", "wms"]),
+        vol.Optional("attribution"): cv.string,
+        vol.Optional("max_zoom"): cv.positive_int,
+        vol.Optional("wms"): _WMS_SCHEMA,
+    }
+)
+_OVERLAY_LAYER_SCHEMA = _BASE_LAYER_SCHEMA.extend(
+    {
+        vol.Optional("opacity", default=1.0): vol.All(
+            vol.Coerce(float), vol.Range(min=0, max=1)
+        ),
+    }
+)
+_MAP_TILE_LAYER_SCHEMA = vol.Schema(
+    {
+        vol.Required("base"): _BASE_LAYER_SCHEMA,
+        vol.Optional("overlays", default=list): [_OVERLAY_LAYER_SCHEMA],
+    }
+)
+
+
 CONFIG_SCHEMA = vol.Schema(
     {
         DOMAIN: vol.Schema(
@@ -167,6 +233,9 @@ CONFIG_SCHEMA = vol.Schema(
                 vol.Optional(CONF_MAP_TILE_URL): cv.string,
                 vol.Optional(CONF_MAP_TILE_ATTRIBUTION): cv.string,
                 vol.Optional(CONF_MAP_TILE_MAX_ZOOM): cv.positive_int,
+                # Tier 2: nested form with WMS + overlay support. Takes
+                # precedence over the flat map_tile_url keys above.
+                vol.Optional(CONF_MAP_TILE_LAYER): _MAP_TILE_LAYER_SCHEMA,
                 # We no longer use these options.
                 vol.Optional(CONF_EXTRA_HTML_URL): cv.match_all,
                 vol.Optional(CONF_EXTRA_HTML_URL_ES5): cv.match_all,
@@ -656,6 +725,15 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         frozenset(map_tile_items) if map_tile_items else None
     )
 
+    # Tier 2: nested map_tile_layer config wins when present.
+    if (map_tile_layer := conf.get(CONF_MAP_TILE_LAYER)) is not None:
+        if hass.data[DATA_MAP_TILE_LAYER] is not None:
+            _LOGGER.warning(
+                "Both flat map_tile_url and nested map_tile_layer are configured;"
+                " the nested form wins."
+            )
+        hass.data[DATA_MAP_TILE_LAYER] = _freeze(map_tile_layer)
+
     await _async_setup_themes(hass, conf.get(CONF_THEMES))
 
     return True
@@ -792,12 +870,16 @@ async def _async_setup_themes(
 @callback
 @lru_cache(maxsize=1)
 def _async_render_index_cached(template: jinja2.Template, **kwargs: Any) -> str:
-    # Some keys (e.g. map_tile_layer) arrive as a hashable frozenset of items
-    # so this function can be lru_cache-keyed. The template expects a dict, so
-    # rehydrate before rendering.
+    # Some keys (e.g. map_tile_layer) arrive as a hashable frozenset/tuple
+    # structure so this function can be lru_cache-keyed. The template expects
+    # a plain dict/list tree, so rehydrate before rendering.
     map_tile_layer = kwargs.get("map_tile_layer")
     if isinstance(map_tile_layer, frozenset):
+        # Tier 1 flat shape: frozenset of (key, value) tuples → dict.
         kwargs["map_tile_layer"] = dict(map_tile_layer)
+    elif isinstance(map_tile_layer, tuple):
+        # Tier 2 nested shape: recursive tuple-of-tuples → dict/list tree.
+        kwargs["map_tile_layer"] = _thaw(map_tile_layer)
     return template.render(**kwargs)
 
 
@@ -887,7 +969,7 @@ class IndexView(web_urldispatcher.AbstractResource):
 
         extra_modules: frozenset[str]
         extra_js_es5: frozenset[str]
-        map_tile_layer: frozenset[tuple[str, Any]] | None
+        map_tile_layer: tuple | frozenset[tuple[str, Any]] | None
         if hass.config.safe_mode:
             extra_modules = frozenset()
             extra_js_es5 = frozenset()

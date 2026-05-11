@@ -57,6 +57,9 @@ CONF_FRONTEND_REPO = "development_repo"
 CONF_JS_VERSION = "javascript_version"
 CONF_DEVELOPMENT_PR = "development_pr"
 CONF_GITHUB_TOKEN = "github_token"
+CONF_MAP_TILE_URL = "map_tile_url"
+CONF_MAP_TILE_ATTRIBUTION = "map_tile_attribution"
+CONF_MAP_TILE_MAX_ZOOM = "map_tile_max_zoom"
 
 DEV_ARTIFACTS_DIR = "development_artifacts"
 
@@ -66,6 +69,9 @@ DEFAULT_THEME_COLOR = "#2980b9"
 DATA_PANELS: HassKey[dict[str, Panel]] = HassKey("frontend_panels")
 DATA_EXTRA_MODULE_URL: HassKey[UrlManager] = HassKey("frontend_extra_module_url")
 DATA_EXTRA_JS_URL_ES5: HassKey[UrlManager] = HassKey("frontend_extra_js_url_es5")
+DATA_MAP_TILE_LAYER: HassKey[frozenset[tuple[str, Any]] | None] = HassKey(
+    "frontend_map_tile_layer"
+)
 
 DATA_WS_SUBSCRIBERS: HassKey[set[tuple[websocket_api.ActiveConnection, int]]] = HassKey(
     "frontend_ws_subscribers"
@@ -156,6 +162,11 @@ CONFIG_SCHEMA = vol.Schema(
                 vol.Optional(CONF_EXTRA_JS_URL_ES5): vol.All(
                     cv.ensure_list, [cv.string]
                 ),
+                # cv.string (not cv.url) because XYZ templates with {z}/{x}/{y}
+                # placeholders are not parseable as URLs.
+                vol.Optional(CONF_MAP_TILE_URL): cv.string,
+                vol.Optional(CONF_MAP_TILE_ATTRIBUTION): cv.string,
+                vol.Optional(CONF_MAP_TILE_MAX_ZOOM): cv.positive_int,
                 # We no longer use these options.
                 vol.Optional(CONF_EXTRA_HTML_URL): cv.match_all,
                 vol.Optional(CONF_EXTRA_HTML_URL_ES5): cv.match_all,
@@ -634,6 +645,17 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     )
     hass.data[DATA_WS_SUBSCRIBERS] = set()
 
+    map_tile_items: list[tuple[str, Any]] = []
+    if (map_tile_url := conf.get(CONF_MAP_TILE_URL)) is not None:
+        map_tile_items.append(("url", map_tile_url))
+    if (map_tile_attr := conf.get(CONF_MAP_TILE_ATTRIBUTION)) is not None:
+        map_tile_items.append(("attribution", map_tile_attr))
+    if (map_tile_max_zoom := conf.get(CONF_MAP_TILE_MAX_ZOOM)) is not None:
+        map_tile_items.append(("maxZoom", map_tile_max_zoom))
+    hass.data[DATA_MAP_TILE_LAYER] = (
+        frozenset(map_tile_items) if map_tile_items else None
+    )
+
     await _async_setup_themes(hass, conf.get(CONF_THEMES))
 
     return True
@@ -770,6 +792,12 @@ async def _async_setup_themes(
 @callback
 @lru_cache(maxsize=1)
 def _async_render_index_cached(template: jinja2.Template, **kwargs: Any) -> str:
+    # Some keys (e.g. map_tile_layer) arrive as a hashable frozenset of items
+    # so this function can be lru_cache-keyed. The template expects a dict, so
+    # rehydrate before rendering.
+    map_tile_layer = kwargs.get("map_tile_layer")
+    if isinstance(map_tile_layer, frozenset):
+        kwargs["map_tile_layer"] = dict(map_tile_layer)
     return template.render(**kwargs)
 
 
@@ -859,12 +887,15 @@ class IndexView(web_urldispatcher.AbstractResource):
 
         extra_modules: frozenset[str]
         extra_js_es5: frozenset[str]
+        map_tile_layer: frozenset[tuple[str, Any]] | None
         if hass.config.safe_mode:
             extra_modules = frozenset()
             extra_js_es5 = frozenset()
+            map_tile_layer = None
         else:
             extra_modules = hass.data[DATA_EXTRA_MODULE_URL].urls
             extra_js_es5 = hass.data[DATA_EXTRA_JS_URL_ES5].urls
+            map_tile_layer = hass.data.get(DATA_MAP_TILE_LAYER)
 
         response = web.Response(
             text=_async_render_index_cached(
@@ -872,6 +903,7 @@ class IndexView(web_urldispatcher.AbstractResource):
                 theme_color=MANIFEST_JSON["theme_color"],
                 extra_modules=extra_modules,
                 extra_js_es5=extra_js_es5,
+                map_tile_layer=map_tile_layer,
             ),
             content_type="text/html",
         )

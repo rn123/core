@@ -18,6 +18,9 @@ from homeassistant.components.frontend import (
     CONF_EXTRA_JS_URL_ES5,
     CONF_EXTRA_MODULE_URL,
     CONF_GITHUB_TOKEN,
+    CONF_MAP_TILE_ATTRIBUTION,
+    CONF_MAP_TILE_MAX_ZOOM,
+    CONF_MAP_TILE_URL,
     CONF_THEMES,
     CONFIG_SCHEMA,
     DEFAULT_THEME_COLOR,
@@ -691,6 +694,55 @@ async def test_extra_js(
     text = await get_response()
     assert '"/local/my_module_2.js"' not in text
     assert '"/local/my_es5_2.js"' not in text
+
+
+@pytest.fixture
+async def mock_http_client_with_map_tile(
+    hass: HomeAssistant,
+    aiohttp_client: ClientSessionGenerator,
+    ignore_frontend_deps: None,
+) -> TestClient:
+    """Set up frontend with a custom map tile layer config."""
+    assert await async_setup_component(
+        hass,
+        "frontend",
+        {
+            DOMAIN: {
+                CONF_MAP_TILE_URL: "https://tile.example.com/{z}/{x}/{y}.png",
+                CONF_MAP_TILE_ATTRIBUTION: "&copy; Example",
+                CONF_MAP_TILE_MAX_ZOOM: 19,
+            }
+        },
+    )
+    return await aiohttp_client(hass.http.app)
+
+
+@pytest.mark.usefixtures("mock_onboarded")
+async def test_map_tile_layer(
+    mock_http_client_with_map_tile: TestClient,
+) -> None:
+    """Test that map_tile_layer config is rendered into index.html."""
+    resp = await mock_http_client_with_map_tile.get("")
+    assert resp.status == 200
+    text = await resp.text()
+
+    assert "window.__HA_MAP_TILE_LAYER__" in text
+    # tojson html-escapes characters like & into & inside the JSON literal,
+    # which is harmless to JS but means we assert on the raw HTML-encoded form.
+    assert '"url": "https://tile.example.com/{z}/{x}/{y}.png"' in text
+    assert "Example" in text
+    assert '"maxZoom": 19' in text
+
+
+@pytest.mark.usefixtures("mock_onboarded")
+async def test_map_tile_layer_absent_by_default(
+    mock_http_client: TestClient,
+) -> None:
+    """Test that without map_tile_* config, no global is injected."""
+    resp = await mock_http_client.get("")
+    assert resp.status == 200
+    text = await resp.text()
+    assert "__HA_MAP_TILE_LAYER__" not in text
 
 
 async def test_get_panels(
